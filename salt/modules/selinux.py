@@ -23,6 +23,40 @@ from salt.exceptions import CommandExecutionError, SaltInvocationError
 
 # Import 3rd-party libs
 import salt.ext.six as six
+from collections import Iterable
+
+try:
+    handle = None
+    import selinux
+    import semanage
+    HAS_SEMANAGE = True
+
+    SELINUX_ACTIVE = (selinux.is_selinux_enabled() == 1)
+    SELINUX_IS_MLS = (selinux.is_selinux_mls_enabled() == 1)
+    (rc, policy_name) = selinux.selinux_getpolicytype()
+    if rc >= 0:
+        SELINUX_POLICY = policy_name
+
+    handle = semanage.semanage_handle_create()
+    ## 0 == selinux disabled, 1 == selinux enabled, -1 == error
+    assert(semanage.semanage_is_managed(handle) == 1)
+    ## 0 == connect succesful
+    assert(semanage.semanage_connect(handle) == 0)
+    assert(semanage.semanage_access_check(handle) >= semanage.SEMANAGE_CAN_WRITE)
+
+    protocol_map = {
+        'tcp': semanage.SEMANAGE_PROTO_TCP,
+        'udp': semanage.SEMANAGE_PROTO_UDP,
+    }
+except ImportError:
+    HAS_SEMANAGE = False
+except AssertionError:
+    SEMANAGE_ACTIVE = False
+finally:
+    if handle:
+        if semanage.semanage_is_connected(handle) == 1:
+            assert(semanage.semanage_disconnect(handle) == 0)
+        semanage.semanage_handle_destroy(handle)
 
 
 _SELINUX_FILETYPES = {
@@ -51,7 +85,19 @@ def __virtual__():
     # SELinux only makes sense on Linux *obviously*
     if __grains__['kernel'] == 'Linux':
         return 'selinux'
+    if not SELINUX_ACTIVE or not HAS_SEMANAGE:
+        return (False, 'Module only works on Linux with selinux enabled')
     return (False, 'Module only works on Linux with selinux installed')
+
+
+def _range_to_tuple(port_range):
+    if isinstance(port_range, basestring) and '-' in port_range:
+        lo, hi = [ int(n) for n in port_range.split('-', 2) ]
+    elif isinstance(port_range, Iterable):
+        lo, hi = [ int(n) for n in port_range[0:2] ]
+    else:
+        lo = hi = int(port_range)
+    return (lo, hi)
 
 
 # Cache the SELinux directory to not look it up over and over
@@ -253,6 +299,209 @@ def list_sebool():
         ret[comps[0]] = {'State': comps[1][1:],
                          'Default': comps[3][:-1],
                          'Description': ' '.join(comps[4:])}
+    return ret
+
+
+def get_seport(protocol, port_range =None, port =None):
+    '''
+    Return the specific selinux label attached to the given port, if
+    it exists
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' selinux.get_seport protocol=tcp port=80
+    '''
+    proto = protocol_map[protocol]
+    if port is not None:
+        lo = hi = int(port)
+    elif port_range is not None:
+        lo, hi = _range_to_tuple(port_range)
+    else:
+        raise SaltInvocationError('get_seport: either port or port_range must be specified')
+
+    ret = {}
+    try:
+        obj = pkey = None
+        handle = semanage.semanage_handle_create()
+        assert(semanage.semanage_connect(handle) == 0)
+
+        (rc, pkey) = semanage.semanage_port_key_create(handle, lo, hi, proto)
+        assert(rc >= 0)
+        (rc, obj) = semanage.semanage_port_query(handle, pkey)
+        assert(rc >= 0)
+
+        if obj:
+            con = semanage.semanage_port_get_con(obj)
+            (rc, context_str) = semanage.semanage_context_to_string(handle, con)
+            assert(rc >= 0)
+            ret['protocol'] = semanage.semanage_port_get_proto_str(proto)
+            low = semanage.semanage_port_get_low(obj)
+            high = semanage.semanage_port_get_high(obj)
+            if low == high:
+                ret['port'] = low
+            else:
+                ret['port_range'] = (low, high)
+            context = semanage.semanage_port_get_con(obj)
+            (rc, context_str) = semanage.semanage_context_to_string(handle, context)
+            assert(rc >= 0)
+            ret['context'] = context_str
+
+    finally:
+        if obj:
+            semanage.semanage_port_free(obj)
+        if pkey:
+            semanage.semanage_port_key_free(pkey)
+        if handle:
+            if semanage.semanage_is_connected(handle) == 1:
+                assert(semanage.semanage_disconnect(handle) == 0)
+            semanage.semanage_handle_destroy(handle)
+
+    return ret
+
+
+def set_seport(context, protocol, port_range =None, port =None):
+    '''
+    Set the selinux label for the given port
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' selinux.set_seport protocol=tcp port=80 context=system_u:object_r:http_port_t:s0
+    '''
+    proto = protocol_map[protocol]
+    if port is not None:
+        lo = hi = int(port)
+    elif port_range is not None:
+        lo, hi = _range_to_tuple(port_range)
+    else:
+        raise SaltInvocationError('get_seport: either port or port_range must be specified')
+
+    if not isinstance(context, dict):
+        context = _context_string_to_dict(context)
+    else:
+        base = { 'sel_user': 'system_u', 'sel_role': 'object_r', 'sel_level': 's0' }
+        base.update(context)
+        if 'sel_type' not in context:
+            raise SaltInvocationError('context must include the selinux type')
+        context = base
+
+    ret = {}
+    try:
+        obj = pkey = ctx = None
+        handle = semanage.semanage_handle_create()
+        assert(semanage.semanage_connect(handle) == 0)
+
+        (rc, pkey) = semanage.semanage_port_key_create(handle, lo, hi, proto)
+        assert(rc >= 0)
+        (rc, obj) = semanage.semanage_port_query(handle, pkey)
+        assert(rc >= 0)
+
+        if obj: # port definition exists, check if it's correct
+            # a context obtained through _get_con should not be manually freed
+            _ctx = semanage.semanage_port_get_con(obj)
+            (rc, cur_context_str) = semanage.semanage_context_to_string(handle, _ctx)
+            assert(rc >= 0)
+            if cur_context_str != _context_dict_to_string(context):
+                semanage.semanage_context_set_user(handle, _ctx, context['sel_user'])
+                semanage.semanage_context_set_role(handle, _ctx, context['sel_role'])
+                semanage.semanage_context_set_type(handle, _ctx, context['sel_type'])
+                if SELINUX_IS_MLS:
+                    semanage.semanage_context_set_mls(handle, _ctx, context['sel_level'])
+                assert(semanage.semanage_begin_transaction(handle) >= 0)
+                #semanage.semanage_port_set_con(handle, obj, _ctx)
+                assert(semanage.semanage_port_modify_local(handle, pkey, obj) >= 0)
+                assert(semanage.semanage_commit(handle) >= 0)
+                (rc, new_context_str) = semanage.semanage_context_to_string(handle, _ctx)
+                assert(rc >= 0)
+                ret['context'] = { 'old': cur_context_str, 'new': new_context_str }
+
+        else: # object does not yet exist
+            (rc, obj) = semanage.semanage_port_create(handle)
+            assert(rc >= 0)
+            semanage.semanage_port_set_proto(obj, proto)
+            semanage.semanage_port_set_range(obj, lo, hi)
+            # a context obtained through _context_create should be manually freed
+            (rc, ctx) = semanage.semanage_context_create(handle)
+            assert(rc >= 0)
+            semanage.semanage_context_set_user(handle, ctx, context['sel_user'])
+            semanage.semanage_context_set_role(handle, ctx, context['sel_role'])
+            semanage.semanage_context_set_type(handle, ctx, context['sel_type'])
+            if SELINUX_IS_MLS:
+                semanage.semanage_context_set_mls(handle, ctx, context['sel_level'])
+            semanage.semanage_port_set_con(handle, obj, ctx)
+            assert(semanage.semanage_begin_transaction(handle) >= 0)
+            assert(semanage.semanage_port_modify_local(handle, pkey, obj) >= 0)
+            assert(semanage.semanage_commit(handle) >= 0)
+            (rc, new_context_str) = semanage.semanage_context_to_string(handle, ctx)
+            assert(rc >= 0)
+            elem = {
+                'protocol': semanage.semanage_port_get_proto_str(proto),
+                'context': new_context_str,
+            }
+            if lo == hi:
+                elem['port'] = lo
+            else:
+                elem['port_range'] = (lo, hi)
+            ret['new'] = [ elem ]
+
+    finally:
+        if pkey:
+            semanage.semanage_port_key_free(pkey)
+        if obj:
+            semanage.semanage_port_free(obj)
+        if ctx:
+            semanage.semanage_context_free(ctx)
+        if handle:
+            if semanage.semanage_is_connected(handle) == 1:
+                assert(semanage.semanage_disconnect(handle) == 0)
+            semanage.semanage_handle_destroy(handle)
+
+    return ret
+
+
+def list_seport():
+    '''
+    Return a structure listing all of the selinux ports on the system and
+    what state they are in
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' selinux.list_seport
+    '''
+
+    ret = []
+    try:
+        handle = semanage.semanage_handle_create()
+        assert(semanage.semanage_connect(handle) == 0)
+        (rc, plist) = semanage.semanage_port_list_local(handle)
+        assert(rc >= 0)
+        for p in plist:
+            d = {}
+            proto = semanage.semanage_port_get_proto(p)
+            d['protocol'] = semanage.semanage_port_get_proto_str(proto)
+            low = semanage.semanage_port_get_low(p)
+            high = semanage.semanage_port_get_high(p)
+            if low == high:
+                d['port'] = low
+            else:
+                d['port_range'] = (low, high)
+            context = semanage.semanage_port_get_con(p)
+            (rc, context_str) = semanage.semanage_context_to_string(handle, context)
+            assert(rc >= 0)
+            d['context'] = context_str
+            ret.append(d)
+
+    finally:
+        if handle:
+            if semanage.semanage_is_connected(handle) == 1:
+                assert(semanage.semanage_disconnect(handle) == 0)
+            semanage.semanage_handle_destroy(handle)
+
     return ret
 
 
